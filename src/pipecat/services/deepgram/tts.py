@@ -22,12 +22,10 @@ from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
     Frame,
-    InterruptionFrame,
-    LLMFullResponseEndFrame,
     StartFrame,
     TTSAudioRawFrame,
+    TTSStoppedFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import TTSSettings, _warn_deprecated_param
 from pipecat.services.tts_service import TTSService, WebsocketTTSService
 from pipecat.utils.tracing.service_decorators import traced_tts
@@ -130,6 +128,7 @@ class DeepgramTTSService(WebsocketTTSService):
         self._base_url = base_url
         self._encoding = encoding
 
+        self._current_context_id = None
         self._receive_task = None
 
     def can_generate_metrics(self) -> bool:
@@ -166,19 +165,6 @@ class DeepgramTTSService(WebsocketTTSService):
         """
         await super().cancel(frame)
         await self._disconnect()
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Process frames with special handling for LLM response end.
-
-        Args:
-            frame: The frame to process.
-            direction: The direction of frame processing.
-        """
-        await super().process_frame(frame, direction)
-
-        # When the LLM finishes responding, flush any remaining text in Deepgram's buffer
-        if isinstance(frame, (LLMFullResponseEndFrame, EndFrame)):
-            await self.flush_audio()
 
     async def _connect(self):
         """Connect to Deepgram WebSocket and start receive task."""
@@ -276,19 +262,20 @@ class DeepgramTTSService(WebsocketTTSService):
             return self._websocket
         raise Exception("Websocket not connected")
 
-    async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
-        """Handle interruption by sending Clear message to Deepgram.
+    async def on_audio_context_interrupted(self, context_id: str):
+        """Send Clear message to Deepgram when an audio context is interrupted.
 
         The Clear message will clear Deepgram's internal text buffer and stop
         sending audio, allowing for a new response to be generated.
-        """
-        await super()._handle_interruption(frame, direction)
 
-        # Send Clear message to stop current audio generation
+        Args:
+            context_id: The ID of the audio context that was interrupted.
+        """
+        await self.stop_all_metrics()
+        self._current_context_id = None
         if self._websocket:
             try:
-                clear_msg = {"type": "Clear"}
-                await self._websocket.send(json.dumps(clear_msg))
+                await self._websocket.send(json.dumps({"type": "Clear"}))
             except Exception as e:
                 logger.error(f"{self} error sending Clear message: {e}")
 
@@ -297,11 +284,12 @@ class DeepgramTTSService(WebsocketTTSService):
         async for message in self._get_websocket():
             if isinstance(message, bytes):
                 # Binary message contains audio data
-                await self.stop_ttfb_metrics()
-                frame = TTSAudioRawFrame(
-                    message, self.sample_rate, 1, context_id=self.get_active_audio_context_id()
-                )
-                await self.push_frame(frame)
+                ctx_id = self._current_context_id
+                if ctx_id and self.audio_context_available(ctx_id):
+                    frame = TTSAudioRawFrame(message, self.sample_rate, 1, context_id=ctx_id)
+                    await self.append_to_audio_context(ctx_id, frame)
+                else:
+                    logger.trace(f"{self}: discarding audio for stale context {ctx_id}")
             elif isinstance(message, str):
                 # Text message contains metadata or control messages
                 try:
@@ -312,12 +300,18 @@ class DeepgramTTSService(WebsocketTTSService):
                         logger.trace(f"Received metadata: {msg}")
                     elif msg_type == "Flushed":
                         logger.trace(f"Received Flushed: {msg}")
-                        # Flushed indicates the end of audio generation for the current buffer
-                        # This happens after flush_audio() is called
+                        ctx_id = self._current_context_id
+                        if ctx_id and self.audio_context_available(ctx_id):
+                            if self._push_stop_frames:
+                                await self.append_to_audio_context(
+                                    ctx_id, TTSStoppedFrame(context_id=ctx_id)
+                                )
+                            await self.remove_audio_context(ctx_id)
+                        self._current_context_id = None
                     elif msg_type == "Cleared":
                         logger.trace(f"Received Cleared: {msg}")
-                        # Buffer has been cleared after interruption
-                        # TTSStoppedFrame will be sent by the interruption handler
+                        # Buffer has been cleared after interruption.
+                        # The on_audio_context_interrupted handler already cleaned up.
                     elif msg_type == "Warning":
                         logger.warning(
                             f"{self} warning: {msg.get('description', 'Unknown warning')}"
@@ -358,7 +352,7 @@ class DeepgramTTSService(WebsocketTTSService):
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
 
-            await self.start_tts_usage_metrics(text)
+            self._current_context_id = context_id
 
             # Send text message to Deepgram
             # Note: We don't send Flush here - that should only be sent when the
