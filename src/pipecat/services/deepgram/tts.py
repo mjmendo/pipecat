@@ -117,7 +117,7 @@ class DeepgramTTSService(WebsocketTTSService):
         super().__init__(
             sample_rate=sample_rate,
             pause_frame_processing=True,
-            push_stop_frames=True,
+            push_stop_frames=False,
             push_start_frame=True,
             append_trailing_space=True,
             settings=default_settings,
@@ -128,7 +128,6 @@ class DeepgramTTSService(WebsocketTTSService):
         self._base_url = base_url
         self._encoding = encoding
 
-        self._current_context_id = None
         self._receive_task = None
 
     def can_generate_metrics(self) -> bool:
@@ -272,7 +271,6 @@ class DeepgramTTSService(WebsocketTTSService):
             context_id: The ID of the audio context that was interrupted.
         """
         await self.stop_all_metrics()
-        self._current_context_id = None
         if self._websocket:
             try:
                 await self._websocket.send(json.dumps({"type": "Clear"}))
@@ -284,7 +282,7 @@ class DeepgramTTSService(WebsocketTTSService):
         async for message in self._get_websocket():
             if isinstance(message, bytes):
                 # Binary message contains audio data
-                ctx_id = self._current_context_id
+                ctx_id = self.get_active_audio_context_id()
                 if ctx_id and self.audio_context_available(ctx_id):
                     frame = TTSAudioRawFrame(message, self.sample_rate, 1, context_id=ctx_id)
                     await self.append_to_audio_context(ctx_id, frame)
@@ -300,14 +298,12 @@ class DeepgramTTSService(WebsocketTTSService):
                         logger.trace(f"Received metadata: {msg}")
                     elif msg_type == "Flushed":
                         logger.trace(f"Received Flushed: {msg}")
-                        ctx_id = self._current_context_id
+                        ctx_id = self.get_active_audio_context_id()
                         if ctx_id and self.audio_context_available(ctx_id):
-                            if self._push_stop_frames:
-                                await self.append_to_audio_context(
-                                    ctx_id, TTSStoppedFrame(context_id=ctx_id)
-                                )
+                            await self.append_to_audio_context(
+                                ctx_id, TTSStoppedFrame(context_id=ctx_id)
+                            )
                             await self.remove_audio_context(ctx_id)
-                        self._current_context_id = None
                     elif msg_type == "Cleared":
                         logger.trace(f"Received Cleared: {msg}")
                         # Buffer has been cleared after interruption.
@@ -351,8 +347,6 @@ class DeepgramTTSService(WebsocketTTSService):
             # Reconnect if the websocket is closed
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
-
-            self._current_context_id = context_id
 
             # Send text message to Deepgram
             # Note: We don't send Flush here - that should only be sent when the
