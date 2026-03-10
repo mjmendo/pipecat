@@ -135,6 +135,10 @@ A structured walkthrough of the Pipecat framework, building understanding from f
 | 4b | Interruption Sequence (Example 2) + Function Calling (Example 3) | `04-interruption-sequence.excalidraw` |
 | 5 | Interruption Flow | *(pending)* |
 
+## Fork Maintenance
+
+See [`MAINTAINING-FORK.md`](./MAINTAINING-FORK.md) for how to sync this fork with upstream and update tour-docs content.
+
 ## Key Reference Files
 
 | File | Purpose |
